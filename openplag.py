@@ -9,13 +9,15 @@ Pipeline
 
 Required : Python 3.10+, `requests`
 Optional : pymupdf | pypdf (PDF), python-docx (DOCX), antiword/libreoffice (DOC),
-           trafilatura (better HTML extraction), sentence-transformers
-           (semantic paraphrase), torch + transformers (neural AI detector)
+           trafilatura (better HTML extraction), pytesseract/ocrmypdf (OCR for scans),
+           sentence-transformers (semantic paraphrase), torch + transformers (neural AI)
+           -> see requirements.txt
 
 Usage
   python openplag.py essay.pdf --json report.json
   python openplag.py --text "pasted text ..."
-  python openplag.py essay.docx --local-corpus ./refs --searxng http://localhost:8080
+  python openplag.py essay.docx --html report.html --local-corpus ./refs
+  python openplag.py --check-searx          # probe public SearXNG instances for JSON support
 """
 from __future__ import annotations
 
@@ -25,6 +27,8 @@ import html as htmllib
 import json
 import logging
 import math
+import os
+import random
 import re
 import shutil
 import sqlite3
@@ -81,7 +85,19 @@ class Config:
     # exclusions
     exclude_quotes: bool = True
     exclude_references: bool = True
+    exclude_citations: bool = True      # (Smith, 2020) and [1] markers don't count
+    common_phrase_sources: int = 4      # short matches found in >= N sources = boilerplate
+    common_phrase_max_tokens: int = 15
+    store_max_df: int = 20              # ignore stored fingerprints seen in > N documents
+    # ingestion
+    ocr: bool = True                    # OCR scanned PDFs (pytesseract or ocrmypdf)
+    # SearXNG failover pool. Best: your own instance(s) (see deploy/). Public instances are
+    # opt-in (--public-searx) and best-effort: most disable JSON or rate-limit API-style clients.
+    searx_instances: tuple = ()         # extra instances, tried in order after --searxng
+    searx_discover: bool = True         # with --public-searx, fall back to searx.space listings
     # infra
+    search_cache_hours: int = 24
+    cache_max_mb: int = 500
     cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "openplag")
     cache_ttl_days: int = 7
     contact_email: str = ""         # polite-pool identification (OpenAlex etc.)
@@ -173,6 +189,9 @@ def split_sentences(text: str) -> list[tuple[int, int]]:
 
 _QUOTE_RE = re.compile(r'\u201c([^\u201d]{25,}?)\u201d|"([^"\n]{25,}?)"')
 _REF_RE = re.compile(r"^\s*(references|bibliography|works cited|reference list)\s*:?\s*$", re.I | re.M)
+_CITE_RE = re.compile(
+    r"\((?=[A-Z][^()]{2,119}\b(?:19|20)\d{2}[a-z]?\b)[^()]*\)"      # (Smith & Jones, 2020, p. 4)
+    r"|\[\d+(?:\s*[,\u2013\-]\s*\d+)*\]")                           # [1]  [2, 5]  [3-7]
 
 
 def _hash(gram) -> int:
@@ -220,7 +239,49 @@ def content_set(words: list) -> set:
 # ============================================================================
 # Document ingestion  (pdf / docx / doc / txt / html / raw text)
 # ============================================================================
-def pdf_to_text(data: bytes, max_pages: int = 300) -> str:
+def _ocr_pdf(data: bytes, max_pages: int = 60) -> str:
+    """OCR a scanned PDF: pytesseract (needs the tesseract binary) or the ocrmypdf CLI."""
+    try:
+        import io
+        import fitz
+        import pytesseract
+        from PIL import Image
+        out = []
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    break
+                img = Image.open(io.BytesIO(page.get_pixmap(dpi=200).tobytes("png")))
+                out.append(pytesseract.image_to_string(img))
+        return "\n".join(out)
+    except ImportError:
+        pass
+    except Exception as e:                     # e.g. tesseract binary missing
+        log.warning("pytesseract OCR failed: %s", e)
+    exe = shutil.which("ocrmypdf")
+    if exe:
+        with tempfile.TemporaryDirectory() as td:
+            src, side = Path(td) / "in.pdf", Path(td) / "out.txt"
+            src.write_bytes(data)
+            try:
+                subprocess.run([exe, "--force-ocr", "-q", "--sidecar", str(side), str(src), str(Path(td) / "o.pdf")],
+                               check=True, timeout=600, capture_output=True)
+                return side.read_text(errors="replace")
+            except Exception as e:
+                log.warning("ocrmypdf failed: %s", e)
+    log.warning("No OCR engine available: pip install pytesseract pillow (+ tesseract) or ocrmypdf")
+    return ""
+
+
+def pdf_to_text(data: bytes, max_pages: int = 300, ocr: bool = True) -> str:
+    text = _pdf_native(data, max_pages)
+    if ocr and len(text.strip()) < 100:
+        log.info("PDF has no usable text layer - trying OCR")
+        text = _ocr_pdf(data) or text
+    return text
+
+
+def _pdf_native(data: bytes, max_pages: int = 300) -> str:
     try:
         import fitz  # PyMuPDF
         with fitz.open(stream=data, filetype="pdf") as doc:
@@ -308,12 +369,12 @@ def html_to_text(markup: str) -> str:
     return "".join(p.out)
 
 
-def extract_text(path: str) -> str:
+def extract_text(path: str, ocr: bool = True) -> str:
     """Extract plain text from a document on disk."""
     p = Path(path)
     ext = p.suffix.lower()
     if ext == ".pdf":
-        text = pdf_to_text(p.read_bytes())
+        text = pdf_to_text(p.read_bytes(), ocr=ocr)
         if len(text.strip()) < 50:
             log.warning("PDF has almost no text layer - it may be scanned; OCR (ocrmypdf) is needed")
         return text
@@ -329,9 +390,21 @@ def extract_text(path: str) -> str:
 # ============================================================================
 # HTTP (polite: per-host throttle, robots.txt, size cap) + disk cache
 # ============================================================================
+@dataclass
+class Resp:
+    status: int                      # 0 = network error, -1 = blocked by robots.txt
+    data: bytes = b""
+    ctype: str = ""
+    enc: Optional[str] = None
+    retry_after: float = 0.0
+
+
 class Http:
     INTERVAL = {"html.duckduckgo.com": 2.0, "export.arxiv.org": 3.0, "api.openalex.org": 0.15,
-                "www.ebi.ac.uk": 0.2, "en.wikipedia.org": 0.1}
+                "www.ebi.ac.uk": 0.2, "en.wikipedia.org": 0.1, "api.crossref.org": 0.1,
+                "api.semanticscholar.org": 1.5, "api.core.ac.uk": 1.0,
+                "api2.marginalia-search.com": 2.0, "archive.org": 1.0}
+    RETRY_STATUS = {429, 500, 502, 503, 504}
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -343,8 +416,8 @@ class Http:
         self._lock = threading.Lock()
         self._robots: dict = {}
 
-    def _wait(self, host: str):
-        gap = self.INTERVAL.get(host, 0.5)
+    def _wait(self, host: str, gap: Optional[float] = None):
+        gap = self.INTERVAL.get(host, 0.5) if gap is None else gap
         with self._lock:
             now = time.monotonic()
             slot = max(now, self._last.get(host, 0) + gap)
@@ -366,52 +439,98 @@ class Http:
             self._robots[base] = rp
         return rp.can_fetch(self.cfg.user_agent, url)
 
-    def get(self, url, params=None, max_bytes=8_000_000, timeout=15, robots=False):
-        """-> (bytes, content_type, encoding) or None"""
+    def request(self, url, params=None, headers=None, max_bytes=8_000_000, timeout=15,
+                robots=False, retries=2, gap=None) -> Resp:
+        """GET with per-host throttling and exponential backoff (honours Retry-After)
+        on 429/5xx and network errors. Never raises."""
         if not self.s:
-            return None
-        try:
-            if robots and self.cfg.respect_robots and not self.allowed(url):
-                log.debug("robots.txt disallows %s", url)
-                return None
-            self._wait(urlparse(url).hostname or "")
-            r = self.s.get(url, params=params, timeout=timeout, stream=True)
-            if r.status_code != 200:
-                return None
-            buf = bytearray()
-            for chunk in r.iter_content(65536):
-                buf.extend(chunk)
-                if len(buf) > max_bytes:
-                    break
-            return bytes(buf), r.headers.get("Content-Type", ""), r.encoding
-        except Exception as e:
-            log.debug("GET %s failed: %s", url, e)
-            return None
+            return Resp(0)
+        if robots and self.cfg.respect_robots and not self.allowed(url):
+            log.debug("robots.txt disallows %s", url)
+            return Resp(-1)
+        host = urlparse(url).hostname or ""
+        resp = Resp(0)
+        for attempt in range(retries + 1):
+            self._wait(host, gap)
+            try:
+                r = self.s.get(url, params=params, headers=headers, timeout=timeout, stream=True)
+                ra = str(r.headers.get("Retry-After", ""))
+                buf = bytearray()
+                if r.status_code == 200:
+                    for chunk in r.iter_content(65536):
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            break
+                r.close()
+                resp = Resp(r.status_code, bytes(buf), r.headers.get("Content-Type", ""), r.encoding,
+                            float(ra) if ra.isdigit() else 0.0)
+            except Exception as e:
+                log.debug("GET %s failed: %s", url, e)
+                resp = Resp(0)
+            if resp.status == 200 or (resp.status and resp.status not in self.RETRY_STATUS):
+                return resp
+            if attempt < retries:
+                time.sleep(min(20.0, resp.retry_after or 2 ** attempt) + random.uniform(0, 0.4))
+        return resp
+
+    def get(self, url, params=None, max_bytes=8_000_000, timeout=15, robots=False,
+            headers=None, retries=2):
+        """-> (bytes, content_type, encoding) on HTTP 200, else None"""
+        r = self.request(url, params=params, headers=headers, max_bytes=max_bytes, timeout=timeout,
+                         robots=robots, retries=retries)
+        return (r.data, r.ctype, r.enc) if r.status == 200 else None
 
 
 class DiskCache:
-    def __init__(self, d: Path, ttl_days: int):
-        self.d, self.ttl = Path(d), ttl_days * 86400
+    """Tiny JSON file cache. Empty-string values are *negative* entries (1h TTL).
+    Oldest files are pruned when the directory exceeds max_mb."""
+    NEG_TTL = 3600
+
+    def __init__(self, d: Path, ttl_days: int, max_mb: int = 500):
+        self.d, self.ttl, self.max_bytes = Path(d), ttl_days * 86400, max_mb * 1_000_000
         try:
             self.d.mkdir(parents=True, exist_ok=True)
+            self._prune()
         except OSError:
             pass
+
+    def _prune(self):
+        files = [(f.stat().st_mtime, f.stat().st_size, f) for f in self.d.glob("*.json")]
+        total = sum(sz for _, sz, _ in files)
+        if total <= self.max_bytes:
+            return
+        for _, sz, f in sorted(files):
+            f.unlink(missing_ok=True)
+            total -= sz
+            if total <= self.max_bytes * 0.8:
+                break
 
     def _p(self, key):
         return self.d / (hashlib.sha1(key.encode()).hexdigest() + ".json")
 
-    def get(self, key) -> Optional[str]:
+    def get(self, key, ttl: Optional[float] = None) -> Optional[str]:
         try:
             o = json.loads(self._p(key).read_text())
-            return o["text"] if time.time() - o["ts"] < self.ttl else None
+            limit = self.NEG_TTL if o["text"] == "" else (ttl or self.ttl)
+            return o["text"] if time.time() - o["ts"] < limit else None
         except Exception:
             return None
 
-    def put(self, key, text):
+    def put(self, key, text: str):
         try:
             self._p(key).write_text(json.dumps({"ts": time.time(), "text": text}))
         except OSError:
             pass
+
+    def get_json(self, key, ttl: Optional[float] = None):
+        t = self.get(key, ttl)
+        try:
+            return json.loads(t) if t else None
+        except ValueError:
+            return None
+
+    def put_json(self, key, obj):
+        self.put(key, json.dumps(obj))
 
 
 # ============================================================================
@@ -479,18 +598,225 @@ class DuckDuckGo(Backend):
         return out
 
 
-class SearXNG(Backend):
-    """Self-hosted metasearch (https://docs.searxng.org). Enable `json` in settings.yml."""
+class SearXNGPool(Backend):
+    """
+    Failover pool of SearXNG instances (your own first, then public ones).
+    Instances are tried in order; one that returns 403 (JSON disabled), non-JSON,
+    429/503, errors, or only blocked engines is put on cooldown and the next is used.
+    If every listed instance is down, instances listed on searx.space are tried.
+    Public instances change often - run `python openplag.py --check-searx` to see
+    which currently serve JSON.
+    """
     name = "searxng"
+    DISCOVERY_URL = "https://searx.space/data/instances.json"
+    LONG, SHORT = 86400, 3600          # cooldown seconds: JSON unsupported / rate-limited or down
 
-    def __init__(self, http, cfg, base_url: str):
+    def __init__(self, http, cfg, instances=(), discover=False, cooldown: int = SHORT, cache=None):
         super().__init__(http, cfg)
-        self.base = base_url.rstrip("/")
+        self.instances = list(dict.fromkeys(u.rstrip("/") for u in instances if u))
+        self.discover, self.cooldown, self.cache = discover, cooldown, cache
+        self._down: dict[str, float] = {}
+        self._discovered = False
+        self._lock = threading.Lock()
+
+    # -- health ---------------------------------------------------------------
+    def _usable(self, base: str) -> bool:
+        if self._down.get(base, 0) > time.time():
+            return False
+        if self.cache:                               # health persists across runs
+            d = self.cache.get_json(f"searxdown:{base}", ttl=self.LONG + 60)
+            if d and d.get("until", 0) > time.time():
+                self._down[base] = d["until"]
+                return False
+        return True
+
+    def _mark(self, base: str, seconds: float, why: str):
+        until = time.time() + seconds
+        with self._lock:
+            self._down[base] = until
+        if self.cache:
+            self.cache.put_json(f"searxdown:{base}", {"until": until, "why": why})
+        log.info("SearXNG %s unavailable (%s) for %ds", base, why, seconds)
+
+    # -- one request ------------------------------------------------------------
+    def _query(self, base: str, phrase: str, n: int):
+        r = self.http.request(base + "/search", params={"q": f'"{phrase}"', "format": "json"},
+                              retries=0, timeout=12, gap=2.5)
+        if r.status == 200:
+            try:
+                d = json.loads(r.data.decode("utf-8", "replace"))
+            except ValueError:
+                return None, "not_json"
+            if not isinstance(d, dict) or "results" not in d:
+                return None, "not_json"
+            res = [Source(url=x["url"], title=x.get("title", ""), kind="web")
+                   for x in d["results"] if x.get("url")]
+            if not res and len(d.get("unresponsive_engines") or []) >= 3:
+                return None, "engines_blocked"
+            return res, "ok"
+        if r.status == 403:
+            return None, "json_disabled"
+        if r.status in (429, 503):
+            return None, "rate_limited"
+        return None, "unreachable" if r.status == 0 else f"http_{r.status}"
+
+    # -- discovery ----------------------------------------------------------------
+    def discover_instances(self, limit: int = 8) -> list[str]:
+        key = "searx:discovered"
+        cached = self.cache.get_json(key, ttl=6 * 3600) if self.cache else None
+        if cached:
+            return cached
+        r = self.http.request(self.DISCOVERY_URL, retries=1, timeout=30, max_bytes=30_000_000)
+        if r.status != 200:
+            return []
+        try:
+            data = json.loads(r.data.decode("utf-8", "replace")).get("instances", {})
+        except ValueError:
+            return []
+        scored = []
+        for url, info in data.items():
+            if ".onion" in url or ".i2p" in url:
+                continue
+            if ((info or {}).get("http") or {}).get("status_code") != 200:
+                continue
+            t = ((info or {}).get("timing") or {}).get("search") or {}
+            ok = t.get("success_percentage") or 0
+            med = (t.get("all") or {}).get("median") or 9
+            scored.append((-ok, med, url.rstrip("/")))
+        found = [u for _, _, u in sorted(scored)[:limit]]
+        if found and self.cache:
+            self.cache.put_json(key, found)
+        return found
+
+    def _try_discover(self) -> bool:
+        with self._lock:
+            if not self.discover or self._discovered:
+                return False
+            self._discovered = True
+        new = [u for u in self.discover_instances() if u not in self.instances]
+        with self._lock:
+            self.instances += new
+        return bool(new)
+
+    # -- API ----------------------------------------------------------------------
+    def search(self, phrase, n):
+        for attempt in range(2):
+            for base in list(self.instances):
+                if not self._usable(base):
+                    continue
+                res, why = self._query(base, phrase, n)
+                if res is not None:
+                    return res[:n]
+                self._mark(base, self.LONG if why in ("json_disabled", "not_json") else self.cooldown, why)
+            if attempt == 0 and not self._try_discover():
+                break
+        return []
+
+    def probe(self, urls=None) -> list[dict]:
+        """Check which instances currently serve JSON search results."""
+        out = []
+        for base in (urls or list(self.instances)):
+            t = time.time()
+            res, why = self._query(base, "photosynthesis chlorophyll", 3)
+            out.append({"instance": base, "ok": bool(res), "reason": why if not res else "ok",
+                        "results": len(res or []), "ms": int((time.time() - t) * 1000)})
+        return out
+
+
+class Crossref(Backend):
+    """Crossref metadata (DOIs, abstracts when deposited). Low yield for body text."""
+    name = "crossref"
 
     def search(self, phrase, n):
-        d = _json(self.http.get(self.base + "/search", params={"q": f'"{phrase}"', "format": "json"}))
+        params = {"query": phrase, "rows": n, "select": "DOI,title,URL,abstract,link"}
+        if self.cfg.contact_email:
+            params["mailto"] = self.cfg.contact_email
+        d = _json(self.http.get("https://api.crossref.org/works", params=params))
+        out = []
+        for it in d.get("message", {}).get("items", []):
+            abstract = htmllib.unescape(re.sub(r"<[^>]+>", " ", it.get("abstract") or "")).strip()
+            pdf = next((l.get("URL", "") for l in it.get("link", []) if "pdf" in (l.get("content-type") or "")), "")
+            url = it.get("URL") or (f"https://doi.org/{it['DOI']}" if it.get("DOI") else "")
+            if url and (abstract or pdf):
+                out.append(Source(url=url, title=(it.get("title") or [""])[0], kind="academic",
+                                  text=abstract, fetch_url=pdf))
+        return out
+
+
+class SemanticScholar(Backend):
+    """Free tier (shared, easily rate-limited). Set S2_API_KEY for a dedicated limit."""
+    name = "semanticscholar"
+
+    def search(self, phrase, n):
+        key = os.environ.get("S2_API_KEY")
+        d = _json(self.http.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={"query": phrase, "limit": n, "fields": "title,abstract,url,openAccessPdf,externalIds"},
+            headers={"x-api-key": key} if key else None))
+        out = []
+        for it in d.get("data", []):
+            doi = (it.get("externalIds") or {}).get("DOI")
+            url = f"https://doi.org/{doi}" if doi else it.get("url")
+            pdf = (it.get("openAccessPdf") or {}).get("url") or ""
+            if url and (it.get("abstract") or pdf):
+                out.append(Source(url=url, title=it.get("title") or "", kind="academic",
+                                  text=it.get("abstract") or "", fetch_url=pdf))
+        return out
+
+
+class CORE(Backend):
+    """CORE open-access aggregator. Needs a free key: https://core.ac.uk/services/api -> CORE_API_KEY."""
+    name = "core"
+
+    def search(self, phrase, n):
+        key = os.environ.get("CORE_API_KEY")
+        if not key:
+            return []
+        d = _json(self.http.get("https://api.core.ac.uk/v3/search/works",
+                                params={"q": f'"{phrase}"', "limit": n},
+                                headers={"Authorization": f"Bearer {key}"}))
+        out = []
+        for it in d.get("results", []):
+            doi = it.get("doi")
+            url = f"https://doi.org/{doi}" if doi else (it.get("downloadUrl") or "")
+            text = it.get("fullText") or it.get("abstract") or ""
+            if url and (text or it.get("downloadUrl")):
+                out.append(Source(url=url, title=it.get("title") or "", kind="academic", text=text,
+                                  fetch_url="" if it.get("fullText") else (it.get("downloadUrl") or "")))
+        return out
+
+
+class Marginalia(Backend):
+    """Independent/small-web index. 'public' key is shared and often overloaded (503)."""
+    name = "marginalia"
+
+    def search(self, phrase, n):
+        key = os.environ.get("MARGINALIA_API_KEY", "public")
+        d = _json(self.http.get("https://api2.marginalia-search.com/search",
+                                params={"query": phrase, "count": n}, headers={"API-Key": key}, retries=1))
         return [Source(url=r["url"], title=r.get("title", ""), kind="web")
-                for r in d.get("results", [])[:n] if r.get("url")]
+                for r in d.get("results", []) if r.get("url")]
+
+
+class InternetArchive(Backend):
+    """EXPERIMENTAL: advancedsearch matches item metadata, not page text, so yield is low.
+    (archive.org's full-text-search API is still beta and changing.)"""
+    name = "archive"
+
+    def search(self, phrase, n):
+        terms = [w for w in dict.fromkeys(phrase.split()) if w not in STOP and len(w) > 3][:5]
+        if not terms:
+            return []
+        q = "mediatype:texts AND (" + " AND ".join(terms) + ")"
+        d = _json(self.http.get("https://archive.org/advancedsearch.php", params=[
+            ("q", q), ("fl[]", "identifier"), ("fl[]", "title"), ("rows", n), ("output", "json")]))
+        out = []
+        for it in d.get("response", {}).get("docs", []):
+            i = it.get("identifier")
+            if i:
+                out.append(Source(url=f"https://archive.org/details/{i}", title=str(it.get("title", "")),
+                                  kind="library", fetch_url=f"https://archive.org/download/{i}/{i}_djvu.txt"))
+        return out
 
 
 class Wikipedia(Backend):
@@ -576,15 +902,22 @@ class ArXiv(Backend):
         return out
 
 
-BACKENDS = {"ddg": DuckDuckGo, "wikipedia": Wikipedia, "openalex": OpenAlex,
-            "europepmc": EuropePMC, "arxiv": ArXiv}
-DEFAULT_BACKENDS = ("wikipedia", "openalex", "europepmc", "ddg")
+BACKENDS = {"ddg": DuckDuckGo, "wikipedia": Wikipedia, "openalex": OpenAlex, "europepmc": EuropePMC,
+            "arxiv": ArXiv, "crossref": Crossref, "semanticscholar": SemanticScholar, "core": CORE,
+            "marginalia": Marginalia, "archive": InternetArchive}
+DEFAULT_BACKENDS = ("wikipedia", "openalex", "europepmc", "crossref")   # + SearXNG pool; core/S2 auto-on with keys
 
 
-def build_backends(http, cfg, names=DEFAULT_BACKENDS, searxng_url: str = "") -> list[Backend]:
+def build_backends(http, cfg, names=DEFAULT_BACKENDS, searxng_url: str = "",
+                   public_searx: bool = False, cache=None) -> list[Backend]:
+    names = list(names)
+    for env, n in (("CORE_API_KEY", "core"), ("S2_API_KEY", "semanticscholar")):
+        if os.environ.get(env) and n not in names:
+            names.append(n)
     out = [BACKENDS[n](http, cfg) for n in names if n in BACKENDS]
-    if searxng_url:
-        out.append(SearXNG(http, cfg, searxng_url))
+    inst = ([searxng_url] if searxng_url else []) + (list(cfg.searx_instances) if public_searx else [])
+    if inst or public_searx:
+        out.append(SearXNGPool(http, cfg, inst, discover=public_searx and cfg.searx_discover, cache=cache))
     return out
 
 
@@ -618,15 +951,22 @@ class FingerprintStore:
         return doc_id
 
     def query(self, doc_fps: dict[int, list[int]]) -> dict[str, list[int]]:
-        """-> {stored_doc_id: sorted submission token positions of shared fingerprints}"""
-        hits: dict[str, set] = defaultdict(set)
+        """-> {stored_doc_id: sorted submission token positions of shared fingerprints}.
+        Fingerprints present in more than cfg.store_max_df stored documents are boilerplate and skipped."""
+        by_hash: dict[int, set] = defaultdict(set)
         keys = list(doc_fps)
         for i in range(0, len(keys), 500):
             chunk = keys[i:i + 500]
             q = ",".join("?" * len(chunk))
             for h, d in self.db.execute(f"SELECT h, doc FROM fps WHERE h IN ({q})",
                                         [self._signed(x) for x in chunk]):
-                hits[d].update(doc_fps[h if h >= 0 else h + (1 << 64)])
+                by_hash[h if h >= 0 else h + (1 << 64)].add(d)
+        hits: dict[str, set] = defaultdict(set)
+        for h, docs in by_hash.items():
+            if len(docs) > self.cfg.store_max_df:
+                continue
+            for d in docs:
+                hits[d].update(doc_fps[h])
         return {d: sorted(p) for d, p in hits.items()}
 
     def meta(self, doc_id: str) -> tuple:
@@ -985,8 +1325,8 @@ class PlagiarismDetector:
                  neural_ai: Optional[NeuralAIDetector] = None, store: Optional[FingerprintStore] = None):
         self.cfg = cfg or Config()
         self.http = Http(self.cfg)
-        self.cache = DiskCache(self.cfg.cache_dir, self.cfg.cache_ttl_days)
-        self.backends = build_backends(self.http, self.cfg) if backends is None else backends
+        self.cache = DiskCache(self.cfg.cache_dir, self.cfg.cache_ttl_days, self.cfg.cache_max_mb)
+        self.backends = build_backends(self.http, self.cfg, cache=self.cache) if backends is None else backends
         self.neural = neural_ai
         self.store = store
         self.local_sources: list[Source] = []
@@ -1004,7 +1344,7 @@ class PlagiarismDetector:
 
     # ---- public API --------------------------------------------------------
     def analyze_file(self, path: str, **kw) -> Report:
-        return self.analyze(extract_text(path), **kw)
+        return self.analyze(extract_text(path, ocr=self.cfg.ocr), **kw)
 
     def analyze(self, text: str, web: bool = True, check_ai: bool = True) -> Report:
         t0, cfg = time.time(), self.cfg
@@ -1081,13 +1421,18 @@ class PlagiarismDetector:
 
     # ---- internals ---------------------------------------------------------
     def _excluded_mask(self, doc: Prepared) -> list[bool]:
+        """Tokens that don't count: quoted passages and in-text citations."""
         mask = [False] * len(doc.tok.words)
-        if not self.cfg.exclude_quotes:
-            return mask
         st = doc.tok.starts
-        for m in _QUOTE_RE.finditer(doc.text):
-            for i in range(bisect_left(st, m.start()), bisect_left(st, m.end())):
-                mask[i] = True
+        pats = []
+        if self.cfg.exclude_quotes:
+            pats.append(_QUOTE_RE)
+        if self.cfg.exclude_citations:
+            pats.append(_CITE_RE)
+        for pat in pats:
+            for m in pat.finditer(doc.text):
+                for i in range(bisect_left(st, m.start()), bisect_left(st, m.end())):
+                    mask[i] = True
         return mask
 
     def _discover(self, queries: list[str]) -> list[Source]:
@@ -1096,11 +1441,18 @@ class PlagiarismDetector:
 
         def run(job):
             b, q = job
+            key = f"search:{b.name}:{q}"
+            hit = self.cache.get_json(key, ttl=cfg.search_cache_hours * 3600)
+            if hit is not None:
+                return [Source(**d) for d in hit]
             try:
-                return b.search(q, cfg.results_per_query)
+                res = b.search(q, cfg.results_per_query)
             except Exception as e:
                 log.debug("%s failed: %s", b.name, e)
                 return []
+            if res:                                  # never cache empties (may be an outage)
+                self.cache.put_json(key, [asdict(x) for x in res])
+            return res
 
         with ThreadPoolExecutor(max_workers=min(8, max(1, len(self.backends) * 2))) as ex:
             for results in ex.map(run, jobs):
@@ -1129,24 +1481,31 @@ class PlagiarismDetector:
     def _fetch_one(self, s: Source):
         url = s.fetch_url or s.url
         cached = self.cache.get(url)
-        if cached is not None:
-            s.text = cached
+        if cached is not None:                       # "" = recent failure (negative cache)
+            self._merge_text(s, cached)
             return
         got = self.http.get(url, robots=(s.kind == "web"))
-        if not got:
-            return
-        data, ctype, enc = got
-        try:
-            if "pdf" in ctype.lower() or url.lower().endswith(".pdf") or data[:4] == b"%PDF":
-                text = pdf_to_text(data, max_pages=80)
-            else:
-                text = html_to_text(data.decode(enc or "utf-8", "replace"))
-        except Exception as e:
-            log.debug("extract failed %s: %s", url, e)
-            return
+        text = ""
+        if got:
+            data, ctype, enc = got
+            try:
+                if "pdf" in ctype.lower() or url.lower().endswith(".pdf") or data[:4] == b"%PDF":
+                    text = pdf_to_text(data, max_pages=80, ocr=False)
+                else:
+                    text = html_to_text(data.decode(enc or "utf-8", "replace"))
+            except Exception as e:
+                log.debug("extract failed %s: %s", url, e)
         if len(text) > 200:
-            s.text = text
             self.cache.put(url, text)
+            self._merge_text(s, text)
+        else:
+            self.cache.put(url, "")
+
+    @staticmethod
+    def _merge_text(s: Source, text: str):
+        """Keep any pre-supplied abstract; add fetched full text after it."""
+        if text and text not in s.text:
+            s.text = (s.text + "\n\n" + text) if s.text else text
 
     def _get_embedder(self):
         if self._embedder is None:
@@ -1176,6 +1535,19 @@ class PlagiarismDetector:
         quoted, live = [], []
         for r in raws:
             (quoted if sum(excluded[r.a:r.b]) >= 0.8 * (r.b - r.a) else live).append(r)
+        # boilerplate filter: a SHORT match found independently in many sources is a stock phrase
+        per_tok: dict[int, set] = defaultdict(set)
+        for r in live:
+            for i in range(r.a, r.b):
+                per_tok[i].add(r.src)
+
+        def is_common(r: Raw) -> bool:
+            if r.b - r.a > self.cfg.common_phrase_max_tokens:
+                return False
+            c = sorted(len(per_tok[i]) for i in range(r.a, r.b))
+            return c[len(c) // 2] >= self.cfg.common_phrase_sources
+
+        live = [r for r in live if not is_common(r)]
         by_src: dict[int, list[Raw]] = defaultdict(list)
         for r in live:
             by_src[r.src].append(r)
@@ -1209,6 +1581,132 @@ class PlagiarismDetector:
 
 
 # ============================================================================
+# HTML report (self-contained; light/dark; colour-coded highlights + source links)
+# ============================================================================
+_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenPlag report</title>
+<style>
+:root{--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--card:#f4f4f6;--bd:#dcdce0;--ml:84%;--hi:#f6b8b8;--mid:#f7e3a1;--lo:#d3ecd3}
+@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--mut:#9a9aa2;--card:#222226;--bd:#38383e;--ml:30%;--hi:#7a2d2d;--mid:#6b5a1f;--lo:#2b4a2b}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:880px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:1.3rem;margin:0 0 12px}
+.row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 16px;flex:1 1 260px}
+.big{font-size:2.2rem;font-weight:700;line-height:1.1}
+.mut{color:var(--mut);font-size:.85rem}
+ol{padding-left:0;list-style:none;margin:0}
+ol li{display:flex;gap:10px;margin:8px 0;align-items:flex-start;overflow-wrap:anywhere}
+.sw{flex:none;width:14px;height:14px;border-radius:3px;margin-top:5px;background:hsl(var(--h) 70% var(--ml))}
+.tabs button{border:1px solid var(--bd);background:var(--card);color:var(--fg);padding:6px 14px;border-radius:8px;cursor:pointer;margin-right:6px}
+.tabs button.on{border-color:var(--fg);font-weight:600}
+.doc{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--bd);border-radius:10px;padding:16px;margin-top:12px}
+a.m,span.m{background:hsl(var(--h) 70% var(--ml));color:inherit;text-decoration:none;border-radius:3px}
+a.m:hover{outline:2px solid var(--fg)}
+.m.q{background:none;border-bottom:2px dashed var(--mut)}
+.m.paraphrase{border-bottom:2px dotted var(--fg)}
+sup{font-size:.7em;margin-left:1px;font-weight:700}
+.ai.hi{background:var(--hi)}.ai.mid{background:var(--mid)}.ai.lo{background:var(--lo)}
+.warn{border-left:4px solid #d9a400;padding:6px 12px;margin:8px 0;background:var(--card)}
+a{color:inherit}
+</style></head><body><main>
+<h1>OpenPlag similarity report</h1>
+<div class="row">
+ <div class="card"><div class="big">@@PCT@@%</div><div class="mut">similarity - @@MATCHED@@ of @@ELIGIBLE@@ counted words matched</div></div>
+ @@AICARD@@
+</div>
+@@WARNINGS@@
+<div class="card" style="margin-bottom:16px"><b>Sources</b><ol>@@SOURCES@@</ol></div>
+<div class="tabs"><button id="bp" class="on">Plagiarism view</button><button id="ba">AI-content view</button></div>
+<div class="doc" id="vp">@@PLAG@@</div>
+<div class="doc" id="va" hidden>@@AIVIEW@@</div>
+<p class="mut">Solid colour = near-verbatim copy, dotted underline = paraphrase, dashed = quote/citation (not counted).
+Click a highlight to open the source (supported browsers jump to the matching passage).</p>
+</main>
+<script>
+const P=document.getElementById('vp'),A=document.getElementById('va'),bp=document.getElementById('bp'),ba=document.getElementById('ba');
+bp.onclick=()=>{P.hidden=false;A.hidden=true;bp.className='on';ba.className=''};
+ba.onclick=()=>{P.hidden=true;A.hidden=false;ba.className='on';bp.className=''};
+</script></body></html>"""
+
+
+def _safe_href(u: str) -> Optional[str]:
+    return u if urlparse(u).scheme in ("http", "https") else None
+
+
+def render_html(rep: Report) -> str:
+    esc = htmllib.escape
+    text = rep.text
+    idx = {s.url: i + 1 for i, s in enumerate(rep.sources)}
+    hue = lambda i: (i * 47) % 360
+
+    out, cur = [], 0
+    for m in sorted(rep.matches, key=lambda m: (m.start, m.quoted)):
+        a = max(m.start, cur)
+        if m.end <= a:
+            continue
+        out.append(esc(text[cur:a]))
+        n = idx.get(m.source_url)
+        label = "excluded" if m.quoted else m.kind
+        tip = f"{label} match ({m.similarity:.0%}) - {m.source_title or m.source_url}"
+        href = _safe_href(m.highlight_url or m.source_url)
+        tag = "a" if href else "span"
+        attrs = f' href="{esc(href, quote=True)}" target="_blank" rel="noopener noreferrer"' if href else ""
+        sup = f"<sup>{n}</sup>" if n and not m.quoted else ""
+        cls = "q" if m.quoted else m.kind
+        out.append(f'<{tag} class="m {cls}" style="--h:{hue(n or 0)}"{attrs} title="{esc(tip, quote=True)}">'
+                   f'{esc(text[a:m.end])}{sup}</{tag}>')
+        cur = m.end
+    out.append(esc(text[cur:]))
+
+    segs = sorted(rep.ai.segments, key=lambda x: x["start"]) if rep.ai and rep.ai.segments else []
+    if segs:
+        o, cur = [], 0
+        for sg in segs:
+            a = max(sg["start"], cur)
+            if sg["end"] <= a:
+                continue
+            o.append(esc(text[cur:a]))
+            c = "hi" if sg["ai_score"] >= 0.65 else "mid" if sg["ai_score"] >= 0.35 else "lo"
+            o.append(f'<span class="ai {c}" title="AI signal {sg["ai_score"]:.0%}">{esc(text[a:sg["end"]])}</span>')
+            cur = sg["end"]
+        o.append(esc(text[cur:]))
+        ai_view = "".join(o)
+    else:
+        ai_view = ('<span class="mut">Per-passage AI highlighting needs the neural detector '
+                   '(--neural-ai). Showing plain text.</span>\n\n' + esc(text))
+
+    items = []
+    for i, sm in enumerate(rep.sources, 1):
+        href = _safe_href(sm.url)
+        name = esc(sm.title or sm.url)
+        link = f'<a href="{esc(href, quote=True)}" target="_blank" rel="noopener noreferrer">{name}</a>' if href else name
+        items.append(f'<li style="--h:{hue(i)}"><span class="sw"></span><div>{i}. {link}'
+                     f'<div class="mut">{esc(sm.type)} - {sm.percent_of_document}% of document - '
+                     f'{sm.matched_words} words<br>{esc(sm.url)}</div></div></li>')
+    if not items:
+        items = ['<li class="mut">No matching sources found.</li>']
+
+    ai = rep.ai
+    ai_card = ""
+    if ai:
+        score = "n/a" if ai.score is None else f"{ai.score:.0%}"
+        ai_card = (f'<div class="card"><div class="big">{score}</div><div class="mut">AI-content signal: '
+                   f'{esc(ai.label.replace("_", " "))} (confidence {esc(ai.confidence)}; {esc(ai.method)})<br>'
+                   f'{esc(ai.caveat)}</div></div>')
+    warns = "".join(f'<div class="warn">{esc(w)}</div>' for w in rep.warnings)
+
+    html = _HTML
+    for k, v in {"@@PCT@@": str(rep.similarity_percent), "@@MATCHED@@": str(rep.matched_words),
+                 "@@ELIGIBLE@@": str(rep.eligible_words), "@@AICARD@@": ai_card, "@@WARNINGS@@": warns,
+                 "@@SOURCES@@": "".join(items), "@@PLAG@@": "".join(out), "@@AIVIEW@@": ai_view}.items():
+        html = html.replace(k, v)
+    return html
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 def _print_report(rep: Report):
@@ -1216,11 +1714,11 @@ def _print_report(rep: Report):
     for w in rep.warnings:
         print("  !", w)
     print("\nTop sources:")
-    for s in rep.sources[:10]:
-        print(f"  {s.percent_of_document:5.1f}%  [{s.type}] {s.title[:60]}\n          {s.url}")
+    for sm in rep.sources[:10]:
+        print(f"  {sm.percent_of_document:5.1f}%  [{sm.type}] {sm.title[:60]}\n          {sm.url}")
     print("\nMatches:")
     for m in rep.matches[:15]:
-        tag = "quoted" if m.quoted else m.kind
+        tag = "excluded" if m.quoted else m.kind
         print(f"  - ({tag}, {m.similarity:.2f}) \"{m.text[:90]}...\"\n      {m.highlight_url or m.source_url}")
     if rep.ai:
         a = rep.ai
@@ -1236,13 +1734,20 @@ def main():
     ap.add_argument("input", nargs="?", help="file path (.pdf .docx .doc .txt) or '-' for stdin")
     ap.add_argument("--text", help="analyze pasted text instead of a file")
     ap.add_argument("--json", help="write full JSON report here")
+    ap.add_argument("--html", help="write a self-contained HTML report with highlights here")
     ap.add_argument("--local-corpus", help="folder of reference documents to compare against")
     ap.add_argument("--store", help="SQLite fingerprint store path (previous submissions)")
     ap.add_argument("--add-to-store", action="store_true", help="after analysis, add this document to --store")
-    ap.add_argument("--searxng", default="", help="base URL of your SearXNG instance")
+    ap.add_argument("--searxng", default=os.environ.get("OPENPLAG_SEARXNG", ""),
+                    help="base URL of YOUR SearXNG instance, e.g. http://localhost:8080 (env OPENPLAG_SEARXNG)")
+    ap.add_argument("--searx-instances", default="", help="comma list of extra SearXNG instances (failover order)")
+    ap.add_argument("--public-searx", action="store_true",
+                    help="also try public SearXNG instances from searx.space (best-effort; most block API use)")
+    ap.add_argument("--check-searx", action="store_true", help="probe SearXNG instances for JSON support, then exit")
     ap.add_argument("--backends", default=",".join(DEFAULT_BACKENDS), help="comma list: " + ",".join(BACKENDS))
     ap.add_argument("--no-web", action="store_true")
     ap.add_argument("--no-ai", action="store_true")
+    ap.add_argument("--no-ocr", action="store_true")
     ap.add_argument("--neural-ai", action="store_true", help="enable Binoculars (torch+transformers)")
     ap.add_argument("--semantic", action="store_true", help="semantic paraphrase matching")
     ap.add_argument("--email", default="", help="contact email for polite API pools")
@@ -1250,20 +1755,34 @@ def main():
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.WARNING, format="%(message)s")
 
+    cfg = Config(use_semantic=a.semantic, contact_email=a.email, ocr=not a.no_ocr)
+    if a.searx_instances:
+        cfg.searx_instances = tuple(u.strip() for u in a.searx_instances.split(",") if u.strip())
+
+    if a.check_searx:
+        http = Http(cfg)
+        pool = SearXNGPool(http, cfg, ([a.searxng] if a.searxng else []) + list(cfg.searx_instances),
+                           discover=cfg.searx_discover, cache=DiskCache(cfg.cache_dir, cfg.cache_ttl_days))
+        pool._try_discover()
+        print(f"{'instance':45} {'JSON':5} {'reason':15} results   ms")
+        for r in pool.probe():
+            print(f"{r['instance']:45} {'yes' if r['ok'] else 'no':5} {r['reason']:15} {r['results']:7} {r['ms']:5}")
+        return
+
     if a.text:
         text = a.text
     elif a.input == "-":
         text = sys.stdin.read()
     elif a.input:
-        text = extract_text(a.input)
+        text = extract_text(a.input, ocr=cfg.ocr)
     else:
-        ap.error("provide a file, '-', or --text")
+        ap.error("provide a file, '-', --text, or --check-searx")
 
-    cfg = Config(use_semantic=a.semantic, contact_email=a.email)
     store = FingerprintStore(a.store, cfg) if a.store else None
-    det = PlagiarismDetector(cfg, store=store,
+    det = PlagiarismDetector(cfg, backends=[], store=store,
                              neural_ai=NeuralAIDetector() if a.neural_ai and not a.no_ai else None)
-    det.backends = build_backends(det.http, cfg, [n for n in a.backends.split(",") if n], a.searxng)
+    det.backends = build_backends(det.http, cfg, [n for n in a.backends.split(",") if n], a.searxng,
+                                  public_searx=a.public_searx, cache=det.cache)
     if a.local_corpus:
         det.add_local_corpus(a.local_corpus)
     rep = det.analyze(text, web=not a.no_web, check_ai=not a.no_ai)
@@ -1271,6 +1790,9 @@ def main():
     if a.json:
         Path(a.json).write_text(json.dumps(asdict(rep), indent=2, ensure_ascii=False))
         print("JSON report ->", a.json)
+    if a.html:
+        Path(a.html).write_text(render_html(rep), encoding="utf-8")
+        print("HTML report ->", a.html)
     if store and a.add_to_store:
         store.add(text, title=a.input or "pasted text")
 

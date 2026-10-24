@@ -1,0 +1,25 @@
+# OpenPlag - core install:  pip install -r requirements.txt
+# Python 3.10+
+
+# --- required ---------------------------------------------------------------
+requests>=2.31
+
+# --- document ingestion ------------------------------------------------------
+pymupdf>=1.23            # fast PDF text + page rendering for OCR (pypdf is the fallback)
+pypdf>=4.0
+python-docx>=1.1         # .docx (a built-in XML fallback exists if missing)
+trafilatura>=1.8         # better main-content extraction from web pages
+
+# --- OCR for scanned PDFs (python side) --------------------------------------
+# Also needs the Tesseract program installed on the system:
+#   Ubuntu/Debian: sudo apt install tesseract-ocr     macOS: brew install tesseract
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+# Alternative: `pip install ocrmypdf` (also needs tesseract + ghostscript)
+pytesseract>=0.3.10
+Pillow>=10.0
+
+# --- legacy .doc (system tools, not pip) -------------------------------------
+#   sudo apt install antiword        (or install LibreOffice)
+
+# Heavy, optional ML packages are in requirements-ai.txt
+# Tests / development are in requirements-dev.txt

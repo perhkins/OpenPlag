@@ -1,0 +1,11 @@
+# Optional ML extras:  pip install -r requirements.txt -r requirements-ai.txt
+# ~2-3 GB of downloads (torch + models). CPU works; a GPU is much faster.
+
+numpy>=1.24
+
+# Semantic paraphrase matching  (python openplag.py ... --semantic)
+sentence-transformers>=2.7    # downloads all-MiniLM-L6-v2 (~90 MB) on first use
+
+# Neural AI-content detector    (python openplag.py ... --neural-ai)
+torch>=2.1
+transformers>=4.40            # downloads Qwen2.5-0.5B + -Instruct (~2 GB) on first use

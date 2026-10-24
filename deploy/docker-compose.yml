@@ -1,0 +1,18 @@
+# Your own SearXNG for OpenPlag (free, private, JSON enabled).
+#   1) cd deploy
+#   2) sed -i "s|ultrasecretkey|$(openssl rand -hex 32)|" searxng/settings.yml
+#   3) docker compose up -d
+#   4) curl -s 'http://localhost:8080/search?q=test&format=json' | head -c 300     # should print JSON
+#   5) python openplag.py essay.pdf --searxng http://localhost:8080
+#      (or: export OPENPLAG_SEARXNG=http://localhost:8080)
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: openplag-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"        # localhost only - never expose a limiter-less instance publicly
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
