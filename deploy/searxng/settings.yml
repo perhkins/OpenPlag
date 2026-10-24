@@ -1,0 +1,32 @@
+# Minimal SearXNG config for OpenPlag. Everything not listed uses SearXNG's defaults.
+use_default_settings: true
+
+general:
+  instance_name: "openplag-search"
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  default_lang: "en"
+  formats:            # JSON is OFF by default in SearXNG - OpenPlag needs it
+    - html
+    - json
+
+server:
+  secret_key: "ultrasecretkey"     # replaced by the sed command in docker-compose.yml
+  limiter: false                   # private, localhost-only instance; no Redis needed
+  image_proxy: false
+  bind_address: "0.0.0.0"          # inside the container; compose publishes it on 127.0.0.1 only
+  port: 8080
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 10.0
+
+# Tip: each query fans out to many upstream engines from YOUR IP. If an engine starts showing
+# CAPTCHAs (see "unresponsive_engines" in the JSON), disable it in the web UI preferences
+# or trim the engine list with:
+#
+# use_default_settings:
+#   engines:
+#     keep_only: [duckduckgo, brave, mojeek, wikipedia, startpage]

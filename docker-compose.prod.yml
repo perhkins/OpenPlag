@@ -1,0 +1,27 @@
+# Adds automatic HTTPS (Caddy) in front of the UI. Use together with docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# Needs OPENPLAG_DOMAIN in .env pointing at this server (see the deployment guide).
+services:
+  ui:
+    environment:
+      # refuse to start publicly without a password
+      - OPENPLAG_UI_PASSWORD=${OPENPLAG_UI_PASSWORD:?set OPENPLAG_UI_PASSWORD in .env for public deployments}
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - OPENPLAG_DOMAIN=${OPENPLAG_DOMAIN:?set OPENPLAG_DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - ui
+
+volumes:
+  caddy-data:
+  caddy-config:

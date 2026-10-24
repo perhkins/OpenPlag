@@ -1,0 +1,49 @@
+# OpenPlag full stack: SearXNG (search) + API (analysis) + UI (Streamlit)
+#
+#   cp .env.example .env        # then edit .env (see comments inside)
+#   docker compose up -d --build
+#   open http://localhost:8501
+#
+# Only the UI (and, for debugging, the API) are published - and only on 127.0.0.1,
+# so nothing is reachable from the internet until you add the HTTPS proxy
+# (docker-compose.prod.yml).
+services:
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes:
+      - ./deploy/searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - OPENPLAG_SEARXNG=http://searxng:8080
+      - OPENPLAG_DATA_DIR=/data
+    volumes:
+      - openplag-data:/data
+    depends_on:
+      - searxng
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  ui:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.ui
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - OPENPLAG_API_URL=http://api:8000
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:8501:8501"
+
+volumes:
+  openplag-data:
