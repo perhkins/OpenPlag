@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+# tesseract = OCR for scanned PDFs, antiword = legacy .doc files
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tesseract-ocr antiword \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m app && mkdir /data && chown app /data
+WORKDIR /app
+COPY requirements.txt requirements-api.txt ./
+RUN pip install -r requirements.txt -r requirements-api.txt
+COPY openplag.py ./
+COPY api ./api
+USER app
+ENV OPENPLAG_DATA_DIR=/data
+EXPOSE 8000
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

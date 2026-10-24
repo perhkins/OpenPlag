@@ -1,0 +1,5 @@
+# Caddy gets and renews a free HTTPS certificate for this name automatically.
+{$OPENPLAG_DOMAIN} {
+	encode gzip
+	reverse_proxy ui:8501
+}

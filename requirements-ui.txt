@@ -1,0 +1,3 @@
+# Web UI (Streamlit) - talks to the API over HTTP, so it needs almost nothing:
+streamlit>=1.36
+requests>=2.31

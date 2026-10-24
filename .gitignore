@@ -1,5 +1,6 @@
 # Python bytecode and caches
 __pycache__/
+data/
 *.py[cod]
 *$py.class
 .pytest_cache/
@@ -22,6 +23,8 @@ test-results/
 reports/
 *.json
 *.html
+*.pdf
+*.docx
 *.db
 *.sqlite
 *.sqlite3

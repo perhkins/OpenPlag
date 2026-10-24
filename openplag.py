@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 OpenPlag - open-source plagiarism + AI-content detector (zero per-query cost).
 
@@ -1345,8 +1346,11 @@ class PlagiarismDetector:
     def analyze_file(self, path: str, **kw) -> Report:
         return self.analyze(extract_text(path, ocr=self.cfg.ocr), **kw)
 
-    def analyze(self, text: str, web: bool = True, check_ai: bool = True) -> Report:
+    def analyze(self, text: str, web: bool = True, check_ai: bool = True, progress=None) -> Report:
+        """progress: optional callback(stage: str, fraction: float) for UIs / job queues."""
         t0, cfg = time.time(), self.cfg
+        p = progress or (lambda *_: None)
+        p("Reading and cleaning text", 0.03)
         warnings: list[str] = []
         clean, st = normalize_text(text)
         if st["hidden_chars"] or st["homoglyphs"]:
@@ -1367,6 +1371,7 @@ class PlagiarismDetector:
         sent_ranges = _sentence_token_ranges(doc, sent_spans)
         excluded = self._excluded_mask(doc)
 
+        p("Searching the web and academic sources", 0.12)
         # 1. gather candidate sources
         sources: list[Source] = list(self.local_sources)
         n_queries = 0
@@ -1374,8 +1379,10 @@ class PlagiarismDetector:
             queries = plan_queries(doc, sent_ranges, excluded, cfg.max_queries)
             n_queries = len(queries)
             sources += self._discover(queries)
+        p("Downloading candidate sources", 0.40)
         self._fetch_all(sources)
 
+        p("Comparing your text with sources", 0.65)
         # 2. exact / near matching
         raws: list[Raw] = []
         preps: dict[int, Prepared] = {}
@@ -1403,9 +1410,11 @@ class PlagiarismDetector:
             raws += paraphrase_pass(doc, sent_ranges, covered, excluded, sources, preps, cfg,
                                     self._get_embedder() if cfg.use_semantic else None)
 
+        p("Scoring", 0.85)
         # 5. aggregate
         matches, summaries, matched, eligible = self._aggregate(doc, excluded, raws, sources, preps)
 
+        p("Checking for AI-generated writing", 0.92)
         # 6. AI detection
         ai = detect_ai(body, sent_spans, self.neural) if check_ai else None
         if web and not self.backends:
@@ -1629,6 +1638,15 @@ const P=document.getElementById('vp'),A=document.getElementById('va'),bp=documen
 bp.onclick=()=>{P.hidden=false;A.hidden=true;bp.className='on';ba.className=''};
 ba.onclick=()=>{P.hidden=true;A.hidden=false;ba.className='on';bp.className=''};
 </script></body></html>"""
+
+
+def report_from_dict(d: dict) -> Report:
+    """Rebuild a Report from asdict(report) / stored JSON (used by the API to re-render HTML)."""
+    ai = AIResult(**d["ai"]) if d.get("ai") else None
+    return Report(similarity_percent=d["similarity_percent"], eligible_words=d["eligible_words"],
+                  matched_words=d["matched_words"], matches=[Match(**m) for m in d["matches"]],
+                  sources=[SourceSummary(**x) for x in d["sources"]], ai=ai,
+                  warnings=d.get("warnings", []), stats=d.get("stats", {}), text=d["text"])
 
 
 def _safe_href(u: str) -> Optional[str]:

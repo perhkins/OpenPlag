@@ -418,3 +418,14 @@ def test_html_report_escapes_and_links(tmp_path):
     rep.sources[0].url = "javascript:alert(1)"
     rep.matches[0].source_url, rep.matches[0].highlight_url = "javascript:alert(1)", None
     assert 'href="javascript:' not in op.render_html(rep)
+
+
+def test_progress_callback_and_report_roundtrip(tmp_path):
+    seen = []
+    d = local(detector(tmp_path))
+    rep = d.analyze(SRC + " " + OWN, web=False, check_ai=True, progress=lambda stage, f: seen.append((stage, f)))
+    fracs = [f for _, f in seen]
+    assert fracs == sorted(fracs) and fracs[0] < 0.1 and fracs[-1] > 0.9
+    back = op.report_from_dict(json.loads(json.dumps(__import__("dataclasses").asdict(rep))))
+    assert back.similarity_percent == rep.similarity_percent and back.matches[0].text == rep.matches[0].text
+    assert op.render_html(back) == op.render_html(rep)
