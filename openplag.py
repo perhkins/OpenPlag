@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 OpenPlag - open-source plagiarism + AI-content detector (zero per-query cost).
 
